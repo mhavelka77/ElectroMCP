@@ -82,15 +82,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ## Setup with OpenCode
 
-Add to your `.opencode.json` (note the leading dot):
+Add to your `opencode.json`:
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "electromcp": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/electromcp", "electromcp"]
+      "type": "local",
+      "command": ["uv", "run", "--directory", "/path/to/electromcp", "electromcp"]
     }
   }
 }
