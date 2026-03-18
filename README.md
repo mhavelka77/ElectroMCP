@@ -115,10 +115,14 @@ Add to your `opencode.json`:
 | `get_circuit_state` | Get full schematic state as JSON |
 | `render_schematic_view` | Render schematic to PNG image |
 | `run_erc_check` | Run electrical rules check |
-| `move_component` | Move a component to new position |
-| `move_property_label` | Adjust label position (offset or absolute) |
+| `move_component` | Move a component (wires unchanged) |
+| `move_component_with_wires` | Move a component AND update connected wires |
+| `move_property_label` | Adjust label position (works for power symbols too) |
 | `rotate_component` | Change component rotation |
+| `mirror_component` | Mirror/flip a component on x or y axis |
+| `set_component_property` | Change Value, Footprint, or any property in-place |
 | `add_no_connect` | Place no-connect (X) flag on unused pin |
+| `add_text_note` | Place a text annotation (section titles, notes) |
 | `add_multiple` | Batch add multiple elements (one file write) |
 | `delete_component` | Remove a component or power symbol |
 | `delete_wire` | Remove a specific wire segment |

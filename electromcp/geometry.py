@@ -66,6 +66,7 @@ def direction_dx_dy(direction: int) -> tuple[float, float]:
 def pin_world_position(
     comp_x: float, comp_y: float, comp_rotation_deg: float,
     pin_local_x: float, pin_local_y: float,
+    mirror: str = "",
 ) -> tuple[float, float]:
     """Convert pin local coordinates to schematic world coordinates.
 
@@ -76,12 +77,22 @@ def pin_world_position(
         world_y = comp_y - rotated_local_y   (Y-flip)
 
     where ``rotated_local`` applies the standard 2D rotation matrix.
+
+    Mirror is applied before rotation:
+    - ``"x"``: flip horizontally (negate local_x)
+    - ``"y"``: flip vertically (negate local_y)
     """
+    lx, ly = pin_local_x, pin_local_y
+    if mirror == "x":
+        lx = -lx
+    elif mirror == "y":
+        ly = -ly
+
     theta = math.radians(comp_rotation_deg)
     cos_t = math.cos(theta)
     sin_t = math.sin(theta)
-    rotated_x = pin_local_x * cos_t - pin_local_y * sin_t
-    rotated_y = pin_local_x * sin_t + pin_local_y * cos_t
+    rotated_x = lx * cos_t - ly * sin_t
+    rotated_y = lx * sin_t + ly * cos_t
     return comp_x + rotated_x, comp_y - rotated_y
 
 

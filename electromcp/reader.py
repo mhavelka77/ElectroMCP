@@ -82,6 +82,7 @@ def _compute_pin_positions(
     comp_x: float,
     comp_y: float,
     comp_rotation: float,
+    mirror: str = "",
 ) -> list[dict]:
     """Compute world-space pin positions from lib_symbol text.
 
@@ -98,7 +99,7 @@ def _compute_pin_positions(
     pins: list[dict] = []
     for pin_num, pin_name, local_x, local_y in raw_pins:
         wx, wy = pin_world_position(
-            comp_x, comp_y, comp_rotation, local_x, local_y,
+            comp_x, comp_y, comp_rotation, local_x, local_y, mirror,
         )
         # Snap to fine grid so positions match wire endpoints
         wx = snap_fine(wx)
@@ -412,8 +413,30 @@ def _extract_no_connects_from_file(
 _KNOWN_TOP_LEVEL = frozenset({
     "version", "generator", "generator_version", "uuid", "paper",
     "lib_symbols", "symbol", "wire", "label", "junction", "no_connect",
-    "sheet_instances",
+    "text", "sheet_instances",
 })
+
+
+def _extract_text_notes_from_file(
+    raw_text: str,
+) -> list[tuple[str, float, float, float, str]]:
+    """Extract (text, x, y, font_size, uuid) for text notes from raw file."""
+    results: list[tuple[str, float, float, float, str]] = []
+    for m in re.finditer(
+        r'\(text "([^"]*(?:\\.[^"]*)*)"\s+\(at\s+([-\d.]+)\s+([-\d.]+)',
+        raw_text,
+    ):
+        text_val = m.group(1).replace('\\"', '"').replace('\\\\', '\\')
+        x = float(m.group(2))
+        y = float(m.group(3))
+        # Try to find font size and uuid nearby
+        rest = raw_text[m.start():m.start() + 500]
+        size_m = re.search(r'\(size\s+([-\d.]+)', rest)
+        font_size = float(size_m.group(1)) if size_m else 1.27
+        uuid_m = re.search(r'\(uuid "([^"]+)"\)', rest)
+        uid = uuid_m.group(1) if uuid_m else ""
+        results.append((text_val, x, y, font_size, uid))
+    return results
 
 
 def _extract_passthrough_blocks(raw_text: str) -> list[str]:
@@ -516,6 +539,14 @@ def symbol_to_component(skip_sym: object) -> "Component":
 
     is_power = ref.startswith("#PWR") or ref.startswith("#FLG")
 
+    # Extract mirror
+    mirror_val = ""
+    try:
+        if hasattr(skip_sym, 'mirror') and skip_sym.mirror is not None:
+            mirror_val = str(skip_sym.mirror.value) if hasattr(skip_sym.mirror, 'value') else str(skip_sym.mirror)
+    except Exception:
+        pass
+
     # Extract pins
     pins: list[PinEntry] = []
     if skip_sym.pin is not None:
@@ -600,6 +631,7 @@ def symbol_to_component(skip_sym: object) -> "Component":
         pins=pins,
         properties=properties,
         is_power=is_power,
+        mirror=mirror_val,
     )
     return comp
 
@@ -677,12 +709,18 @@ def junction_to_model(skip_junction: object) -> "Junction | None":
 # Render & ERC
 # ---------------------------------------------------------------------------
 
-def render_schematic(schematic_path: str, output_width: int = 2400) -> bytes:
+def render_schematic(
+    schematic_path: str,
+    output_width: int = 2400,
+    crop: tuple[float, float, float, float] | None = None,
+) -> bytes:
     """Render a schematic to PNG via kicad-cli SVG export and cairosvg.
 
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
         output_width: Width of the output PNG in pixels.
+        crop: Optional (x_min_mm, y_min_mm, x_max_mm, y_max_mm) to render
+            only a region of the schematic.  Coordinates are in schematic mm.
 
     Returns:
         Raw PNG image bytes.
@@ -729,10 +767,42 @@ def render_schematic(schematic_path: str, output_width: int = 2400) -> bytes:
                 )
 
         svg_data = svg_path.read_bytes()
+
+        if crop is not None:
+            svg_data = _crop_svg(svg_data, crop)
+
         return cairosvg.svg2png(
             bytestring=svg_data,
             output_width=output_width,
         )
+
+
+def _crop_svg(
+    svg_data: bytes,
+    crop: tuple[float, float, float, float],
+) -> bytes:
+    """Rewrite the SVG viewBox to show only the cropped region.
+
+    KiCad SVGs use a coordinate system where 1 SVG user-unit ≈ 1 mil
+    (1/1000 inch).  Schematic mm coordinates are converted via
+    ``mm * 1000 / 25.4``.  We replace the ``viewBox`` attribute so
+    cairosvg only rasterises the desired rectangle.
+    """
+    x_min_mm, y_min_mm, x_max_mm, y_max_mm = crop
+    SCALE = 1000.0 / 25.4  # mm → mils (SVG user-units)
+    vb_x = x_min_mm * SCALE
+    vb_y = y_min_mm * SCALE
+    vb_w = (x_max_mm - x_min_mm) * SCALE
+    vb_h = (y_max_mm - y_min_mm) * SCALE
+
+    text = svg_data.decode("utf-8")
+    text = re.sub(
+        r'viewBox="[^"]*"',
+        f'viewBox="{vb_x:.2f} {vb_y:.2f} {vb_w:.2f} {vb_h:.2f}"',
+        text,
+        count=1,
+    )
+    return text.encode("utf-8")
 
 
 def run_erc(schematic_path: str) -> dict:

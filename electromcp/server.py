@@ -27,6 +27,7 @@ from .reader import (
     _extract_lib_symbols_from_file,
     _extract_no_connects_from_file,
     _extract_passthrough_blocks,
+    _extract_text_notes_from_file,
     get_circuit_state,
     junction_to_model,
     label_to_model,
@@ -43,6 +44,7 @@ from .writer import (
     PinEntry,
     PropertyEntry,
     SchematicModel,
+    TextNote,
     Wire,
 )
 
@@ -133,7 +135,14 @@ def _load_model_from_file(schematic_path: str) -> SchematicModel:
     for x, y, nc_uuid in _extract_no_connects_from_file(raw_text):
         model.no_connects.append(NoConnect(x=x, y=y, uuid=nc_uuid))
 
-    # Passthrough blocks (text, polyline, global_label, bus, etc.)
+    # Text notes
+    for text_val, tx, ty, fs, uid in _extract_text_notes_from_file(raw_text):
+        kwargs: dict = {"text": text_val, "x": tx, "y": ty, "font_size": fs}
+        if uid:
+            kwargs["uuid"] = uid
+        model.text_notes.append(TextNote(**kwargs))
+
+    # Passthrough blocks (polyline, global_label, bus, etc.)
     model._passthrough_blocks = _extract_passthrough_blocks(raw_text)
 
     return model
@@ -196,12 +205,13 @@ def _count_pins_from_lib_symbol(lib_text: str) -> list[str]:
 
 def _compute_component_pins(
     lib_text: str, comp_x: float, comp_y: float, comp_rotation: float,
+    mirror: str = "",
 ) -> list[dict]:
     """Compute world-space pin positions for a component from its lib_symbol."""
     raw_pins = extract_pins_from_lib_text(lib_text)
     pins: list[dict] = []
     for pin_num, pin_name, local_x, local_y in raw_pins:
-        wx, wy = pin_world_position(comp_x, comp_y, comp_rotation, local_x, local_y)
+        wx, wy = pin_world_position(comp_x, comp_y, comp_rotation, local_x, local_y, mirror)
         wx = snap_fine(wx)
         wy = snap_fine(wy)
         pins.append({
@@ -270,6 +280,10 @@ def render_schematic_view(
     schematic_path: str,
     output_path: str | None = None,
     width: int = 2400,
+    x_min: float | None = None,
+    y_min: float | None = None,
+    x_max: float | None = None,
+    y_max: float | None = None,
 ) -> list:
     """Render the schematic as a PNG image for visual verification.
 
@@ -282,17 +296,28 @@ def render_schematic_view(
     - Power symbols point the correct direction (VCC up, GND down)
     - Overall layout is clean and professional
 
+    Supports optional cropping to zoom into a specific region at higher detail
+    (useful for fixing label overlaps in dense areas).
+
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
         output_path: Optional path to save the PNG file. If not provided,
             a temporary file is created. The file persists for manual inspection.
         width: Output image width in pixels (default 2400). Use 800-1200 for
             quick checks, 2400 for detailed review.
+        x_min: Left edge of crop region in mm (schematic coordinates).
+        y_min: Top edge of crop region in mm.
+        x_max: Right edge of crop region in mm.
+        y_max: Bottom edge of crop region in mm.
 
     Returns:
         List containing an MCP Image content block and a text metadata block.
     """
-    png_bytes = render_schematic(schematic_path, output_width=width)
+    crop = None
+    if x_min is not None and y_min is not None and x_max is not None and y_max is not None:
+        crop = (x_min, y_min, x_max, y_max)
+
+    png_bytes = render_schematic(schematic_path, output_width=width, crop=crop)
 
     # Save to file (temp or user-specified)
     if output_path:
@@ -1041,7 +1066,9 @@ def move_property_label(
 
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
-        reference: Component reference (e.g., "R1").
+        reference: Component reference (e.g., "R1", "U1"). Also works for
+            power symbols — use their reference like "#PWR01" or "#FLG01"
+            to reposition the VCC/GND/PWR_FLAG value text.
         property_name: "Reference" or "Value".
         dx: Horizontal offset in mm (positive = right). Used in offset mode.
         dy: Vertical offset in mm (positive = down). Used in offset mode.
@@ -1125,6 +1152,289 @@ def rotate_component(
         "reference": reference,
         "rotation": rotation,
         "pins": pins,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Property & Value Editing Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def set_component_property(
+    schematic_path: str,
+    reference: str,
+    property_name: str,
+    value: str,
+) -> str:
+    """Set any property on a component (Value, Footprint, Datasheet, or custom).
+
+    The most common use is changing a component's value — e.g., changing a
+    resistor from "10k" to "4.7k" — without having to delete and re-place
+    the component and re-wire everything.
+
+    Also works for power symbols (e.g., "#PWR01") to change any property.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        reference: Component reference (e.g., "R1", "C1", "#PWR01").
+        property_name: Property to change: "Value", "Footprint", "Datasheet",
+            "Description", or any custom property name.
+        value: New value string.
+
+    Returns:
+        JSON confirmation with old and new values.
+    """
+    model = _get_model(schematic_path)
+    comp = model.find_component(reference)
+    if comp is None:
+        return json.dumps({"status": "error", "message": f"Component '{reference}' not found"})
+
+    # Ensure properties are materialised
+    if not comp.properties:
+        comp.properties = comp.build_properties()
+
+    # Also update the shorthand fields on Component
+    if property_name == "Value":
+        old_value = comp.value
+        comp.value = value
+    elif property_name == "Footprint":
+        old_value = comp.footprint
+        comp.footprint = value
+    elif property_name == "Datasheet":
+        old_value = comp.datasheet
+        comp.datasheet = value
+    elif property_name == "Description":
+        old_value = comp.description
+        comp.description = value
+    else:
+        old_value = None
+
+    # Update in the properties list
+    found = False
+    for prop in comp.properties:
+        if prop.name == property_name:
+            if old_value is None:
+                old_value = prop.value
+            prop.value = value
+            found = True
+            break
+
+    if not found:
+        # Add as a new hidden property
+        if old_value is None:
+            old_value = ""
+        comp.properties.append(PropertyEntry(
+            name=property_name, value=value,
+            x=comp.x, y=comp.y, hidden=True,
+        ))
+
+    _save(schematic_path, model)
+
+    return json.dumps({
+        "status": "ok",
+        "reference": reference,
+        "property": property_name,
+        "old_value": old_value or "",
+        "new_value": value,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Smart Move (moves wires with component)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def move_component_with_wires(
+    schematic_path: str,
+    reference: str,
+    x: float,
+    y: float,
+    rotation: float | None = None,
+) -> str:
+    """Move a component AND automatically update connected wires.
+
+    This is the preferred move tool. It:
+    1. Computes old pin positions
+    2. Moves the component to (x, y)
+    3. For each wire endpoint that matched an old pin position, updates it
+       to the corresponding new pin position
+    4. Moves connected no-connects similarly
+
+    This prevents the broken-wires problem that occurs with plain move_component.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        reference: Component reference (e.g., "R1", "U1").
+        x: New X position in mm. Snapped to 2.54mm coarse grid.
+        y: New Y position in mm. Snapped to 2.54mm coarse grid.
+        rotation: New rotation in degrees. If None, keeps current rotation.
+
+    Returns:
+        JSON with new position, updated pin positions, and count of rewired
+        wire endpoints.
+    """
+    model = _get_model(schematic_path)
+    comp = model.find_component(reference)
+    if comp is None:
+        return json.dumps({"status": "error", "message": f"Component '{reference}' not found"})
+
+    lib_text = model.lib_symbol_texts.get(comp.lib_id)
+    if not lib_text:
+        return json.dumps({"status": "error", "message": f"No lib_symbol for '{comp.lib_id}'"})
+
+    # 1. Compute OLD pin positions
+    old_pins = _compute_component_pins(lib_text, comp.x, comp.y, comp.rotation, comp.mirror)
+
+    # 2. Move component
+    sx, sy = snap_point_coarse(x, y)
+    old_rotation = comp.rotation
+    comp.x = sx
+    comp.y = sy
+    if rotation is not None:
+        comp.rotation = rotation
+    comp.properties = []  # Reset for new position
+
+    # 3. Compute NEW pin positions
+    new_pins = _compute_component_pins(lib_text, sx, sy, comp.rotation, comp.mirror)
+
+    # 4. Build old→new mapping
+    TOL = 0.5
+    pin_map: list[tuple[float, float, float, float]] = []  # (old_x, old_y, new_x, new_y)
+    for op, np_ in zip(old_pins, new_pins):
+        pin_map.append((op["x"], op["y"], np_["x"], np_["y"]))
+
+    # 5. Update wire endpoints that match old pin positions
+    wires_updated = 0
+    for wire in model.wires:
+        for old_x, old_y, new_x, new_y in pin_map:
+            if abs(wire.x1 - old_x) <= TOL and abs(wire.y1 - old_y) <= TOL:
+                wire.x1 = new_x
+                wire.y1 = new_y
+                wires_updated += 1
+            if abs(wire.x2 - old_x) <= TOL and abs(wire.y2 - old_y) <= TOL:
+                wire.x2 = new_x
+                wire.y2 = new_y
+                wires_updated += 1
+
+    # 6. Update junctions at old pin positions
+    for junc in model.junctions:
+        for old_x, old_y, new_x, new_y in pin_map:
+            if abs(junc.x - old_x) <= TOL and abs(junc.y - old_y) <= TOL:
+                junc.x = new_x
+                junc.y = new_y
+
+    # 7. Update no-connects at old pin positions
+    for nc in model.no_connects:
+        for old_x, old_y, new_x, new_y in pin_map:
+            if abs(nc.x - old_x) <= TOL and abs(nc.y - old_y) <= TOL:
+                nc.x = new_x
+                nc.y = new_y
+
+    _save(schematic_path, model)
+
+    return json.dumps({
+        "status": "ok",
+        "reference": reference,
+        "position": {"x": sx, "y": sy},
+        "rotation": comp.rotation,
+        "pins": new_pins,
+        "wire_endpoints_updated": wires_updated,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Mirror
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def mirror_component(
+    schematic_path: str,
+    reference: str,
+    axis: str,
+) -> str:
+    """Mirror/flip a component horizontally or vertically.
+
+    This is different from rotation — mirroring flips the pin layout
+    without rotating the symbol body. Useful for placing components
+    symmetrically or flipping an op-amp's inputs.
+
+    After mirroring, wires will be disconnected — re-wire using the
+    new pin positions returned in the response.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        reference: Component reference (e.g., "U1", "D1").
+        axis: "x" for horizontal mirror, "y" for vertical mirror.
+
+    Returns:
+        JSON with updated pin positions.
+    """
+    if axis not in ("x", "y"):
+        return json.dumps({"status": "error", "message": "axis must be 'x' or 'y'"})
+
+    model = _get_model(schematic_path)
+    comp = model.find_component(reference)
+    if comp is None:
+        return json.dumps({"status": "error", "message": f"Component '{reference}' not found"})
+
+    # Toggle mirror — if already mirrored on same axis, clear it
+    if comp.mirror == axis:
+        comp.mirror = ""
+    else:
+        comp.mirror = axis
+    comp.properties = []  # Reset for regeneration
+
+    _save(schematic_path, model)
+
+    lib_text = model.lib_symbol_texts.get(comp.lib_id)
+    pins = _compute_component_pins(lib_text, comp.x, comp.y, comp.rotation, comp.mirror) if lib_text else []
+
+    return json.dumps({
+        "status": "ok",
+        "reference": reference,
+        "mirror": comp.mirror or "none",
+        "pins": pins,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Text Notes
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def add_text_note(
+    schematic_path: str,
+    text: str,
+    x: float,
+    y: float,
+    font_size: float = 2.54,
+) -> str:
+    """Place a text annotation on the schematic.
+
+    Used for section titles like "POWER SUPPLY", "SENSOR INPUT",
+    "MOTOR DRIVER" to visually organise the schematic. These are
+    not net labels — they carry no electrical meaning.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        text: The text string to display.
+        x: X position in mm.
+        y: Y position in mm.
+        font_size: Font size in mm (default 2.54 — larger than component labels).
+
+    Returns:
+        JSON confirmation.
+    """
+    model = _get_model(schematic_path)
+    note = TextNote(text=text, x=x, y=y, font_size=font_size)
+    model.text_notes.append(note)
+    _save(schematic_path, model)
+
+    return json.dumps({
+        "status": "ok",
+        "text": text,
+        "position": {"x": x, "y": y},
+        "font_size": font_size,
     }, indent=2)
 
 

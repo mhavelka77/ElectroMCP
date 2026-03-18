@@ -74,6 +74,7 @@ class Component:
     pins: list[PinEntry] = field(default_factory=list)
     properties: list[PropertyEntry] = field(default_factory=list)
     is_power: bool = False
+    mirror: str = ""  # "", "x", or "y"
 
     def build_properties(self) -> list[PropertyEntry]:
         """Build standard properties if custom ones aren't set."""
@@ -114,9 +115,10 @@ class Component:
             f'\t\t(pin "{p.number}"\n\t\t\t(uuid "{p.uuid}")\n\t\t)'
             for p in self.pins
         )
+        mirror_line = f"\n\t\t(mirror {self.mirror})" if self.mirror else ""
         return f"""\t(symbol
 \t\t(lib_id "{self.lib_id}")
-\t\t(at {fmt(self.x)} {fmt(self.y)} {fmt(self.rotation)})
+\t\t(at {fmt(self.x)} {fmt(self.y)} {fmt(self.rotation)}){mirror_line}
 \t\t(unit {self.unit})
 \t\t(exclude_from_sim no)
 \t\t(in_bom yes)
@@ -217,6 +219,29 @@ class NoConnect:
 
 
 @dataclass
+class TextNote:
+    """A free text annotation on the schematic."""
+    text: str
+    x: float
+    y: float
+    font_size: float = 1.27
+    uuid: str = field(default_factory=_uuid)
+
+    def to_sexpr(self) -> str:
+        """Render this text note as a KiCad S-expression string."""
+        escaped = self.text.replace("\\", "\\\\").replace('"', '\\"')
+        return f"""\t(text "{escaped}"
+\t\t(at {fmt(self.x)} {fmt(self.y)} 0)
+\t\t(effects
+\t\t\t(font
+\t\t\t\t(size {fmt(self.font_size)} {fmt(self.font_size)})
+\t\t\t)
+\t\t)
+\t\t(uuid "{self.uuid}")
+\t)"""
+
+
+@dataclass
 class SchematicModel:
     """In-memory model of a KiCad 9 schematic."""
 
@@ -228,6 +253,7 @@ class SchematicModel:
     labels: list[NetLabel] = field(default_factory=list)
     junctions: list[Junction] = field(default_factory=list)
     no_connects: list[NoConnect] = field(default_factory=list)
+    text_notes: list[TextNote] = field(default_factory=list)
     _passthrough_blocks: list[str] = field(default_factory=list)
 
     def find_component(self, reference: str) -> Component | None:
@@ -324,6 +350,7 @@ class SchematicModel:
         labels_text = "\n".join(lb.to_sexpr() for lb in self.labels)
         junctions_text = "\n".join(j.to_sexpr() for j in self.junctions)
         no_connects_text = "\n".join(nc.to_sexpr() for nc in self.no_connects)
+        text_notes_text = "\n".join(t.to_sexpr() for t in self.text_notes)
         passthrough_text = "\n".join(self._passthrough_blocks)
 
         content = f"""(kicad_sch
@@ -340,6 +367,7 @@ class SchematicModel:
 {labels_text}
 {junctions_text}
 {no_connects_text}
+{text_notes_text}
 {passthrough_text}
 \t(sheet_instances
 \t\t(path "/"
