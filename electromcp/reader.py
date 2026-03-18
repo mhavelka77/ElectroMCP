@@ -768,43 +768,80 @@ def render_schematic(
 
         svg_data = svg_path.read_bytes()
 
-        if crop is not None:
-            svg_data = _crop_svg(svg_data, crop)
+        if crop is None:
+            return cairosvg.svg2png(
+                bytestring=svg_data,
+                output_width=output_width,
+            )
 
-        return cairosvg.svg2png(
-            bytestring=svg_data,
-            output_width=output_width,
-        )
+        return _render_cropped(svg_data, crop, output_width)
 
 
-def _crop_svg(
+def _render_cropped(
     svg_data: bytes,
     crop: tuple[float, float, float, float],
+    output_width: int,
 ) -> bytes:
-    """Rewrite the SVG viewBox, width, and height to show only the cropped region.
+    """Render full SVG then pixel-crop to the requested mm region.
 
-    KiCad 9 SVGs use mm as their coordinate system
-    (``viewBox="0 0 297 210"`` and ``width="297mm"`` for A4), so the crop
-    coordinates map directly — no unit conversion needed.
+    This is more robust than modifying the SVG viewBox because it doesn't
+    depend on SVG coordinate system internals.  Steps:
 
-    All three attributes (viewBox, width, height) must be updated together.
-    If only viewBox is changed, cairosvg preserves the original aspect ratio
-    from width/height, distorting the crop.
+    1. Parse the page dimensions from the SVG viewBox.
+    2. Render the full page at high enough resolution that the cropped
+       region will be *output_width* pixels wide.
+    3. Convert the mm crop box to pixel coordinates.
+    4. Crop with PIL and return PNG bytes.
     """
-    x_min, y_min, x_max, y_max = crop
-    vb_w = x_max - x_min
-    vb_h = y_max - y_min
+    import cairosvg
+    from io import BytesIO
+    from PIL import Image as PILImage
 
+    # Parse page size from viewBox
     text = svg_data.decode("utf-8")
-    text = re.sub(
-        r'viewBox="[^"]*"',
-        f'viewBox="{x_min:.4f} {y_min:.4f} {vb_w:.4f} {vb_h:.4f}"',
-        text,
-        count=1,
-    )
-    text = re.sub(r'width="[^"]*"', f'width="{vb_w:.4f}mm"', text, count=1)
-    text = re.sub(r'height="[^"]*"', f'height="{vb_h:.4f}mm"', text, count=1)
-    return text.encode("utf-8")
+    vb_match = re.search(r'viewBox="([^"]*)"', text)
+    if not vb_match:
+        # Fallback: render without crop
+        return cairosvg.svg2png(bytestring=svg_data, output_width=output_width)
+
+    vb_parts = vb_match.group(1).split()
+    page_w_mm = float(vb_parts[2])
+
+    x_min, y_min, x_max, y_max = crop
+    crop_w_mm = x_max - x_min
+
+    # Render full page at a resolution so the crop region = output_width pixels.
+    # E.g., 40mm crop at 1200px → need 30 px/mm → full A4 at 297*30 = 8910px.
+    # Cap at 10000px to avoid excessive memory.
+    full_render_width = min(int(page_w_mm * output_width / crop_w_mm), 10000)
+    # But never smaller than the requested output_width
+    full_render_width = max(full_render_width, output_width)
+
+    full_png = cairosvg.svg2png(bytestring=svg_data, output_width=full_render_width)
+    full_img = PILImage.open(BytesIO(full_png))
+    fw, fh = full_img.size
+    px_per_mm = fw / page_w_mm
+
+    # Convert mm crop box to pixel coordinates
+    px_x1 = max(0, min(round(x_min * px_per_mm), fw))
+    px_y1 = max(0, min(round(y_min * px_per_mm), fh))
+    px_x2 = max(0, min(round(x_max * px_per_mm), fw))
+    px_y2 = max(0, min(round(y_max * px_per_mm), fh))
+
+    cropped = full_img.crop((px_x1, px_y1, px_x2, px_y2))
+
+    # If the crop came out smaller than requested (due to the render cap),
+    # scale it up so the caller gets the width they asked for.
+    if cropped.width > 0 and cropped.width != output_width:
+        scale = output_width / cropped.width
+        new_h = max(1, round(cropped.height * scale))
+        cropped = cropped.resize(
+            (output_width, new_h), PILImage.Resampling.LANCZOS,
+        )
+
+    buf = BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def run_erc(schematic_path: str) -> dict:
