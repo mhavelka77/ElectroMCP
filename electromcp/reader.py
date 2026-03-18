@@ -781,11 +781,15 @@ def _crop_svg(
     svg_data: bytes,
     crop: tuple[float, float, float, float],
 ) -> bytes:
-    """Rewrite the SVG viewBox to show only the cropped region.
+    """Rewrite the SVG viewBox, width, and height to show only the cropped region.
 
-    KiCad 9 SVGs already use mm as their coordinate system
-    (``viewBox="0 0 297 210"`` for A4), so the crop coordinates
-    map directly — no unit conversion needed.
+    KiCad 9 SVGs use mm as their coordinate system
+    (``viewBox="0 0 297 210"`` and ``width="297mm"`` for A4), so the crop
+    coordinates map directly — no unit conversion needed.
+
+    All three attributes (viewBox, width, height) must be updated together.
+    If only viewBox is changed, cairosvg preserves the original aspect ratio
+    from width/height, distorting the crop.
     """
     x_min, y_min, x_max, y_max = crop
     vb_w = x_max - x_min
@@ -798,6 +802,8 @@ def _crop_svg(
         text,
         count=1,
     )
+    text = re.sub(r'width="[^"]*"', f'width="{vb_w:.4f}mm"', text, count=1)
+    text = re.sub(r'height="[^"]*"', f'height="{vb_h:.4f}mm"', text, count=1)
     return text.encode("utf-8")
 
 
