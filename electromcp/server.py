@@ -6,13 +6,14 @@ place-wire-render-iterate workflow.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
+import tempfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image as MCPImage
 
 from .geometry import (
     extract_pins_from_lib_text,
@@ -265,12 +266,15 @@ def get_circuit_state_tool(schematic_path: str) -> str:
 
 
 @mcp.tool()
-def render_schematic_view(schematic_path: str) -> str:
-    """Render the schematic as a high-resolution PNG image.
+def render_schematic_view(
+    schematic_path: str,
+    output_path: str | None = None,
+    width: int = 2400,
+) -> list:
+    """Render the schematic as a PNG image for visual verification.
 
-    Returns a base64 data URI that can be displayed inline. The image is
-    2400px wide — enough to see component labels, pin connections, and
-    wire routing clearly.
+    Returns the image as a native MCP image content block that the AI agent
+    can see directly, plus a text block with metadata (file path, dimensions).
 
     **USE THIS AFTER EVERY SIGNIFICANT CHANGE** to visually verify:
     - Labels aren't overlapping component bodies
@@ -280,13 +284,36 @@ def render_schematic_view(schematic_path: str) -> str:
 
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
+        output_path: Optional path to save the PNG file. If not provided,
+            a temporary file is created. The file persists for manual inspection.
+        width: Output image width in pixels (default 2400). Use 800-1200 for
+            quick checks, 2400 for detailed review.
 
     Returns:
-        Base64 data URI string: "data:image/png;base64,..."
+        List containing an MCP Image content block and a text metadata block.
     """
-    png_bytes = render_schematic(schematic_path)
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    png_bytes = render_schematic(schematic_path, output_width=width)
+
+    # Save to file (temp or user-specified)
+    if output_path:
+        save_path = Path(output_path)
+        save_path.write_bytes(png_bytes)
+    else:
+        fd, tmp = tempfile.mkstemp(suffix=".png", prefix="schematic_render_")
+        import os
+        os.close(fd)
+        save_path = Path(tmp)
+        save_path.write_bytes(png_bytes)
+
+    size_kb = len(png_bytes) / 1024
+    metadata = json.dumps({
+        "status": "ok",
+        "image_path": str(save_path),
+        "size_kb": round(size_kb, 1),
+        "width": width,
+    })
+
+    return [MCPImage(data=png_bytes, format="png"), metadata]
 
 
 @mcp.tool()
