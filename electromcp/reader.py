@@ -783,22 +783,18 @@ def _crop_svg(
 ) -> bytes:
     """Rewrite the SVG viewBox to show only the cropped region.
 
-    KiCad SVGs use a coordinate system where 1 SVG user-unit ≈ 1 mil
-    (1/1000 inch).  Schematic mm coordinates are converted via
-    ``mm * 1000 / 25.4``.  We replace the ``viewBox`` attribute so
-    cairosvg only rasterises the desired rectangle.
+    KiCad 9 SVGs already use mm as their coordinate system
+    (``viewBox="0 0 297 210"`` for A4), so the crop coordinates
+    map directly — no unit conversion needed.
     """
-    x_min_mm, y_min_mm, x_max_mm, y_max_mm = crop
-    SCALE = 1000.0 / 25.4  # mm → mils (SVG user-units)
-    vb_x = x_min_mm * SCALE
-    vb_y = y_min_mm * SCALE
-    vb_w = (x_max_mm - x_min_mm) * SCALE
-    vb_h = (y_max_mm - y_min_mm) * SCALE
+    x_min, y_min, x_max, y_max = crop
+    vb_w = x_max - x_min
+    vb_h = y_max - y_min
 
     text = svg_data.decode("utf-8")
     text = re.sub(
         r'viewBox="[^"]*"',
-        f'viewBox="{vb_x:.2f} {vb_y:.2f} {vb_w:.2f} {vb_h:.2f}"',
+        f'viewBox="{x_min:.4f} {y_min:.4f} {vb_w:.4f} {vb_h:.4f}"',
         text,
         count=1,
     )
