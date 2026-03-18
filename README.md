@@ -118,9 +118,13 @@ Add to your `opencode.json`:
 | `move_component` | Move a component to new position |
 | `move_property_label` | Adjust label position (offset or absolute) |
 | `rotate_component` | Change component rotation |
-| `delete_component` | Remove a component |
+| `add_no_connect` | Place no-connect (X) flag on unused pin |
+| `add_multiple` | Batch add multiple elements (one file write) |
+| `delete_component` | Remove a component or power symbol |
 | `delete_wire` | Remove a specific wire segment |
 | `delete_all_wires` | Remove all wires (for complete rewiring) |
+| `delete_no_connect` | Remove a no-connect flag |
+| `delete_label` | Remove a net label |
 | `register_library` | Register an external symbol library |
 
 ## Architecture
@@ -137,6 +141,8 @@ electromcp/
 Key design decisions:
 - **kicad-skip** is used read-only for parsing existing schematics
 - **writer.py** generates complete `.kicad_sch` files from an in-memory model — never modifies files in place
+- **Existing schematics are loaded** into the model on first access — external edits and unknown elements (text, polylines, etc.) are preserved across tool calls
+- Pin positions are computed from symbol library data with correct rotation transforms (not relying on kicad-skip)
 - Schematic models are cached in memory for fast multi-step editing
 - All coordinates are in millimeters with Y-axis pointing down
 

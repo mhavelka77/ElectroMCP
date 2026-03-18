@@ -202,6 +202,21 @@ class Junction:
 
 
 @dataclass
+class NoConnect:
+    """A no-connect (X) flag on an unused pin."""
+    x: float
+    y: float
+    uuid: str = field(default_factory=_uuid)
+
+    def to_sexpr(self) -> str:
+        """Render this no-connect as a KiCad S-expression string."""
+        return f"""\t(no_connect
+\t\t(at {fmt(self.x)} {fmt(self.y)})
+\t\t(uuid "{self.uuid}")
+\t)"""
+
+
+@dataclass
 class SchematicModel:
     """In-memory model of a KiCad 9 schematic."""
 
@@ -212,6 +227,8 @@ class SchematicModel:
     wires: list[Wire] = field(default_factory=list)
     labels: list[NetLabel] = field(default_factory=list)
     junctions: list[Junction] = field(default_factory=list)
+    no_connects: list[NoConnect] = field(default_factory=list)
+    _passthrough_blocks: list[str] = field(default_factory=list)
 
     def find_component(self, reference: str) -> Component | None:
         """Find a component by reference designator."""
@@ -263,6 +280,28 @@ class SchematicModel:
         self.wires.clear()
         return n
 
+    def remove_no_connect(self, x: float, y: float,
+                          tolerance: float = 1.0) -> bool:
+        """Remove a no-connect flag near (x, y). Returns True if found."""
+        for i, nc in enumerate(self.no_connects):
+            if self._close(nc.x, x, tolerance) and self._close(nc.y, y, tolerance):
+                self.no_connects.pop(i)
+                return True
+        return False
+
+    def remove_label(self, net_name: str, x: float | None = None,
+                     y: float | None = None, tolerance: float = 1.0) -> bool:
+        """Remove a label by name and optional position. Returns True if found."""
+        for i, lb in enumerate(self.labels):
+            if lb.name == net_name:
+                if x is None or y is None or (
+                    self._close(lb.x, x, tolerance) and
+                    self._close(lb.y, y, tolerance)
+                ):
+                    self.labels.pop(i)
+                    return True
+        return False
+
     def write(self, output_path: str | Path) -> None:
         """Write the complete .kicad_sch file.
 
@@ -284,6 +323,8 @@ class SchematicModel:
         wires_text = "\n".join(w.to_sexpr() for w in self.wires)
         labels_text = "\n".join(lb.to_sexpr() for lb in self.labels)
         junctions_text = "\n".join(j.to_sexpr() for j in self.junctions)
+        no_connects_text = "\n".join(nc.to_sexpr() for nc in self.no_connects)
+        passthrough_text = "\n".join(self._passthrough_blocks)
 
         content = f"""(kicad_sch
 \t(version 20250114)
@@ -298,6 +339,8 @@ class SchematicModel:
 {wires_text}
 {labels_text}
 {junctions_text}
+{no_connects_text}
+{passthrough_text}
 \t(sheet_instances
 \t\t(path "/"
 \t\t\t(page "1")

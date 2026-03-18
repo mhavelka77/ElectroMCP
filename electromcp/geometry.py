@@ -63,6 +63,75 @@ def direction_dx_dy(direction: int) -> tuple[float, float]:
         return math.cos(rad), math.sin(rad)
 
 
+def pin_world_position(
+    comp_x: float, comp_y: float, comp_rotation_deg: float,
+    pin_local_x: float, pin_local_y: float,
+) -> tuple[float, float]:
+    """Convert pin local coordinates to schematic world coordinates.
+
+    KiCad symbol pin coordinates use Y-up convention while the schematic
+    uses Y-down.  The empirically verified transform is::
+
+        world_x = comp_x + rotated_local_x
+        world_y = comp_y - rotated_local_y   (Y-flip)
+
+    where ``rotated_local`` applies the standard 2D rotation matrix.
+    """
+    theta = math.radians(comp_rotation_deg)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    rotated_x = pin_local_x * cos_t - pin_local_y * sin_t
+    rotated_y = pin_local_x * sin_t + pin_local_y * cos_t
+    return comp_x + rotated_x, comp_y - rotated_y
+
+
+def extract_pins_from_lib_text(
+    lib_text: str,
+) -> list[tuple[str, str, float, float]]:
+    """Extract pin info from a lib_symbol S-expression block.
+
+    Returns a deduplicated list of ``(pin_number, pin_name, local_x, local_y)``
+    tuples.  Only the first occurrence of each pin number is kept (handles
+    multi-unit symbols that duplicate graphics).
+    """
+    import re
+
+    pins: list[tuple[str, str, float, float]] = []
+    seen: set[str] = set()
+
+    # Iterate over each (pin ...) block
+    for m in re.finditer(r"\(pin\s+\w+\s+\w+", lib_text):
+        start = m.start()
+        # Find the matching close paren
+        depth = 0
+        i = start
+        while i < len(lib_text):
+            if lib_text[i] == "(":
+                depth += 1
+            elif lib_text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        pin_block = lib_text[start : i + 1]
+
+        at_m = re.search(r"\(at\s+([-\d.]+)\s+([-\d.]+)", pin_block)
+        num_m = re.search(r'\(number "([^"]*)"', pin_block)
+        name_m = re.search(r'\(name "([^"]*)"', pin_block)
+        if at_m and num_m:
+            pin_num = num_m.group(1)
+            if pin_num not in seen:
+                seen.add(pin_num)
+                pin_name = name_m.group(1) if name_m else ""
+                pins.append((
+                    pin_num,
+                    pin_name,
+                    float(at_m.group(1)),
+                    float(at_m.group(2)),
+                ))
+    return pins
+
+
 def wire_stub(px: float, py: float, direction: int, length: float = 7.62) -> tuple[float, float]:
     """Calculate wire stub endpoint from a pin position and outward direction.
 

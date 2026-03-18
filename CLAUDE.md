@@ -30,7 +30,8 @@ You have access to MCP tools that let you design KiCad 9 schematics. You can pla
    - Use two wire segments for L-shaped connections
    - For pin-to-pin: read both pin positions, route wires between them
 7. **Add junctions** with `add_junction` at every T-intersection (3-way wire branch)
-8. **Run `run_erc_check`** — fix any connection errors (goal: 0 errors)
+8. **Mark unused pins** with `add_no_connect` — essential for MCUs with many unused pins
+9. **Run `run_erc_check`** — fix any connection errors (goal: 0 errors)
 
 ### Pass 2: Visual Refinement (CRITICAL — DO NOT SKIP)
 
@@ -116,6 +117,34 @@ adjacent pins. Add a junction at every T-intersection on the bus.
 7. **Don't leave a pin mid-wire** — always split wires at connection points (see Wire Splitting Rule)
 8. **Don't snake wires between adjacent IC pins** — use a vertical bus with horizontal stubs
 9. **Don't let bypass cap GND go upward** — move the cap to a position where GND naturally goes below
+10. **Don't forget no-connects on unused pins** — use `add_no_connect` on every unused pin to avoid ERC errors
+
+## Batch Operations
+
+Use `add_multiple` when adding many elements at once (e.g., 20+ no-connects on
+unused MCU pins, or a batch of wires and junctions). It accepts a JSON array and
+writes the file only ONCE, which is much faster than individual tool calls.
+
+Example — adding no-connects to unused pins:
+```json
+[
+  {"type": "no_connect", "x": 100.0, "y": 50.0},
+  {"type": "no_connect", "x": 100.0, "y": 52.54},
+  {"type": "no_connect", "x": 100.0, "y": 55.08}
+]
+```
+
+Example — mixed batch (wires + junctions + labels):
+```json
+[
+  {"type": "wire", "x1": 100, "y1": 50, "x2": 110, "y2": 50},
+  {"type": "wire", "x1": 110, "y1": 50, "x2": 110, "y2": 60},
+  {"type": "junction", "x": 110, "y": 50},
+  {"type": "label", "name": "SIG_OUT", "x": 110, "y": 50, "rotation": 0}
+]
+```
+
+Supported types: `wire`, `no_connect`, `label`, `junction`, `power_symbol`.
 
 ## Visual Quality Checklist (Pass 2)
 

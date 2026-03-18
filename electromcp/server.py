@@ -14,17 +14,35 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .geometry import snap_point_coarse, snap_point_fine
+from .geometry import (
+    extract_pins_from_lib_text,
+    pin_world_position,
+    snap_fine,
+    snap_point_coarse,
+    snap_point_fine,
+)
 from .library import LibraryManager
-from .reader import get_circuit_state, render_schematic, run_erc
+from .reader import (
+    _extract_lib_symbols_from_file,
+    _extract_no_connects_from_file,
+    _extract_passthrough_blocks,
+    get_circuit_state,
+    junction_to_model,
+    label_to_model,
+    render_schematic,
+    run_erc,
+    symbol_to_component,
+    wire_to_model,
+)
 from .writer import (
-    SchematicModel,
     Component,
-    Wire,
-    NetLabel,
     Junction,
+    NetLabel,
+    NoConnect,
     PinEntry,
     PropertyEntry,
+    SchematicModel,
+    Wire,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,11 +65,99 @@ lib_manager = LibraryManager()
 _models: dict[str, SchematicModel] = {}
 
 
+# ---------------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------------
+
+def _load_model_from_file(schematic_path: str) -> SchematicModel:
+    """Load a SchematicModel from an existing .kicad_sch file.
+
+    Parses all known element types into the model and stores unrecognised
+    top-level S-expression blocks as passthrough so they survive rewrites.
+    """
+    import skip
+
+    path = Path(schematic_path)
+    raw_text = path.read_text(encoding="utf-8")
+
+    model = SchematicModel()
+
+    # Root UUID
+    m = re.search(r'\(uuid "([^"]+)"\)', raw_text[:1000])
+    if m:
+        model.root_uuid = m.group(1)
+
+    # Paper size
+    m = re.search(r'\(paper "([^"]+)"\)', raw_text[:1000])
+    if m:
+        model.paper = m.group(1)
+
+    # Lib symbols — raw text blocks
+    model.lib_symbol_texts = _extract_lib_symbols_from_file(raw_text)
+
+    # Use kicad-skip for structured elements
+    sch = skip.Schematic(str(path))
+
+    # Components (including power symbols)
+    if sch.symbol is not None:
+        for sym in sch.symbol:
+            try:
+                comp = symbol_to_component(sym)
+                model.components.append(comp)
+            except Exception:
+                logger.debug("Skipping unparseable symbol", exc_info=True)
+
+    # Wires
+    if sch.wire is not None:
+        for w in sch.wire:
+            wire = wire_to_model(w)
+            if wire:
+                model.wires.append(wire)
+
+    # Labels
+    if sch.label is not None:
+        for lb in sch.label:
+            label = label_to_model(lb)
+            if label:
+                model.labels.append(label)
+
+    # Junctions
+    if sch.junction is not None:
+        for j in sch.junction:
+            junc = junction_to_model(j)
+            if junc:
+                model.junctions.append(junc)
+
+    # No-connects (regex from raw text — reliable regardless of kicad-skip)
+    for x, y, nc_uuid in _extract_no_connects_from_file(raw_text):
+        model.no_connects.append(NoConnect(x=x, y=y, uuid=nc_uuid))
+
+    # Passthrough blocks (text, polyline, global_label, bus, etc.)
+    model._passthrough_blocks = _extract_passthrough_blocks(raw_text)
+
+    return model
+
+
 def _get_model(schematic_path: str) -> SchematicModel:
-    """Get or create a SchematicModel for the given path."""
+    """Get or create a SchematicModel for the given path.
+
+    If the file already exists but has no cached model, the file is parsed
+    into a new model so that existing elements are preserved.
+    """
     p = str(Path(schematic_path).resolve())
     if p not in _models:
-        _models[p] = SchematicModel()
+        if Path(p).exists():
+            try:
+                _models[p] = _load_model_from_file(p)
+                logger.info("Loaded existing schematic: %s", p)
+            except Exception:
+                logger.warning(
+                    "Failed to load existing schematic, starting fresh: %s",
+                    p, exc_info=True,
+                )
+                _models[p] = SchematicModel()
+        else:
+            _models[p] = SchematicModel()
     return _models[p]
 
 
@@ -61,13 +167,7 @@ def _save(schematic_path: str, model: SchematicModel) -> None:
 
 
 def _next_auto_ref(model: SchematicModel, prefix: str) -> str:
-    """Generate the next available reference with the given prefix.
-
-    Scans existing components in the model for references starting with
-    *prefix* (e.g. ``"#PWR"`` or ``"#FLG"``), finds the highest numeric
-    suffix, and returns the next one formatted with a zero-padded two-digit
-    number (e.g. ``"#PWR01"``, ``"#FLG03"``).
-    """
+    """Generate the next available reference with the given prefix."""
     existing: set[int] = set()
     prefix_len = len(prefix)
     for comp in model.components:
@@ -84,17 +184,32 @@ def _next_auto_ref(model: SchematicModel, prefix: str) -> str:
 
 
 def _count_pins_from_lib_symbol(lib_text: str) -> list[str]:
-    """Extract pin numbers from a lib_symbol text block.
-
-    Returns:
-        Deduplicated list of pin number strings in the order they appear.
-    """
+    """Extract pin numbers from a lib_symbol text block."""
     pin_numbers: list[str] = []
     for m in re.finditer(r'\(number "([^"]+)"', lib_text):
         num = m.group(1)
         if num not in pin_numbers:
             pin_numbers.append(num)
     return pin_numbers
+
+
+def _compute_component_pins(
+    lib_text: str, comp_x: float, comp_y: float, comp_rotation: float,
+) -> list[dict]:
+    """Compute world-space pin positions for a component from its lib_symbol."""
+    raw_pins = extract_pins_from_lib_text(lib_text)
+    pins: list[dict] = []
+    for pin_num, pin_name, local_x, local_y in raw_pins:
+        wx, wy = pin_world_position(comp_x, comp_y, comp_rotation, local_x, local_y)
+        wx = snap_fine(wx)
+        wy = snap_fine(wy)
+        pins.append({
+            "number": pin_num,
+            "name": pin_name,
+            "x": round(wx, 4),
+            "y": round(wy, 4),
+        })
+    return pins
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +235,9 @@ def get_circuit_state_tool(schematic_path: str) -> str:
     """Get the full state of a schematic as JSON.
 
     Returns all components with their exact pin positions (x, y, direction),
-    all wires, labels, junctions, and power symbols. If the file doesn't
-    exist yet, creates a blank schematic and returns empty state.
+    all wires, labels, junctions, power symbols, and no-connect flags.
+    If the file doesn't exist yet, creates a blank schematic and returns
+    empty state.
 
     **Pin positions are EXACT** — use them directly for wire endpoints.
     Pin direction indicates which way wires should extend FROM the pin:
@@ -133,7 +249,8 @@ def get_circuit_state_tool(schematic_path: str) -> str:
         schematic_path: Absolute path to the .kicad_sch file.
 
     Returns:
-        JSON with keys: root_uuid, components, wires, labels, junctions, power_symbols.
+        JSON with keys: root_uuid, components, wires, labels, junctions,
+        power_symbols, no_connects.
         Each component has: reference, value, lib_id, x, y, rotation, pins[].
         Each pin has: number, name, x, y, direction.
     """
@@ -183,6 +300,8 @@ def run_erc_check(schematic_path: str) -> str:
     - Duplicate references (ERROR)
 
     Goal: ZERO errors. Warnings about "power pin not driven" are acceptable.
+
+    Violation positions are in mm, matching all other tool coordinates.
 
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
@@ -261,7 +380,8 @@ def add_component(
     """Place a component on the schematic.
 
     The component is snapped to the 2.54mm coarse grid. After placement,
-    call get_circuit_state to see the exact pin positions for wiring.
+    the response includes exact pin positions for wiring (computed from
+    the symbol definition, correct even for rotated components).
 
     Args:
         schematic_path: Absolute path to the .kicad_sch file.
@@ -273,7 +393,7 @@ def add_component(
         rotation: Rotation in degrees (0, 90, 180, 270). Default 0.
 
     Returns:
-        JSON with placed position and pin info from the written file.
+        JSON with placed position, pin info, and reference.
 
     Example:
         add_component("circuit.kicad_sch", "Device:R", 120, 50, "R1", "10k")
@@ -303,22 +423,15 @@ def add_component(
 
     _save(schematic_path, model)
 
-    # Read back to get resolved pin positions
-    state = get_circuit_state(schematic_path)
-
-    # Find this component in state
-    comp_state = None
-    for c in state.get("components", []):
-        if c["reference"] == reference:
-            comp_state = c
-            break
+    # Compute pin positions from lib data (correct for rotated components)
+    pins = _compute_component_pins(lib_text, sx, sy, rotation)
 
     return json.dumps({
         "status": "ok",
         "reference": reference,
         "position": {"x": sx, "y": sy},
         "rotation": rotation,
-        "component": comp_state,
+        "pins": pins,
     }, indent=2)
 
 
@@ -348,11 +461,9 @@ def add_power_symbol(
         x: X position in mm. Snapped to 1.27mm fine grid.
         y: Y position in mm. Snapped to 1.27mm fine grid.
         rotation: Rotation in degrees. Default 0.
-            For VCC/+5V/+3V3: 0=up (normal), 180=down (inverted — rare).
-            For GND: 0=down (normal), 180=up (inverted — rare).
 
     Returns:
-        JSON with placed position and pin location.
+        JSON with placed position, assigned reference, and pin location.
     """
     model = _get_model(schematic_path)
 
@@ -408,19 +519,12 @@ def add_power_symbol(
     model.components.append(comp)
     _save(schematic_path, model)
 
-    state = get_circuit_state(schematic_path)
-    pwr_state = None
-    for ps in state.get("power_symbols", []):
-        if ps["reference"] == pwr_ref:
-            pwr_state = ps
-            break
-
     return json.dumps({
         "status": "ok",
         "reference": pwr_ref,
         "power_net": power_net,
         "position": {"x": sx, "y": sy},
-        "pin": pwr_state["pins"][0] if pwr_state and pwr_state.get("pins") else {"x": sx, "y": sy},
+        "pin": {"x": sx, "y": sy},
     }, indent=2)
 
 
@@ -546,6 +650,152 @@ def add_junction(schematic_path: str, x: float, y: float) -> str:
     }, indent=2)
 
 
+@mcp.tool()
+def add_no_connect(schematic_path: str, x: float, y: float) -> str:
+    """Place a no-connect (X) flag on an unused pin.
+
+    Essential for MCU-based schematics where many pins are unused.
+    The no-connect flag tells KiCad's ERC that the pin is intentionally
+    unconnected.
+
+    Snapped to the 1.27mm fine grid. Place at the EXACT pin position
+    from get_circuit_state.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        x: X position in mm (pin position).
+        y: Y position in mm (pin position).
+
+    Returns:
+        JSON confirmation with snapped position.
+    """
+    model = _get_model(schematic_path)
+
+    sx, sy = snap_point_fine(x, y)
+    nc = NoConnect(x=sx, y=sy)
+    model.no_connects.append(nc)
+    _save(schematic_path, model)
+
+    return json.dumps({
+        "status": "ok",
+        "position": {"x": sx, "y": sy},
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Batch Operations
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def add_multiple(schematic_path: str, items: str) -> str:
+    """Add multiple elements in a single operation (one file write).
+
+    Much more efficient than individual tool calls when adding many elements.
+    Accepts a JSON array of items, each with a "type" key and type-specific
+    fields. All items are processed and the file is written ONCE at the end.
+
+    Supported item types:
+
+    - ``{"type": "wire", "x1": ..., "y1": ..., "x2": ..., "y2": ...}``
+    - ``{"type": "no_connect", "x": ..., "y": ...}``
+    - ``{"type": "label", "name": "SIG", "x": ..., "y": ..., "rotation": 0}``
+    - ``{"type": "junction", "x": ..., "y": ...}``
+    - ``{"type": "power_symbol", "net": "VCC", "x": ..., "y": ..., "rotation": 0}``
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        items: JSON string — array of item objects.
+
+    Returns:
+        JSON summary with counts of items added and any errors.
+    """
+    model = _get_model(schematic_path)
+
+    try:
+        item_list = json.loads(items)
+    except json.JSONDecodeError as e:
+        return json.dumps({"status": "error", "message": f"Invalid JSON: {e}"})
+
+    if not isinstance(item_list, list):
+        return json.dumps({"status": "error", "message": "items must be a JSON array"})
+
+    counts: dict[str, int] = {}
+    errors: list[str] = []
+
+    for i, item in enumerate(item_list):
+        item_type = item.get("type", "")
+        try:
+            if item_type == "wire":
+                sx1, sy1 = snap_point_fine(item["x1"], item["y1"])
+                sx2, sy2 = snap_point_fine(item["x2"], item["y2"])
+                model.wires.append(Wire(x1=sx1, y1=sy1, x2=sx2, y2=sy2))
+                counts["wire"] = counts.get("wire", 0) + 1
+
+            elif item_type == "no_connect":
+                sx, sy = snap_point_fine(item["x"], item["y"])
+                model.no_connects.append(NoConnect(x=sx, y=sy))
+                counts["no_connect"] = counts.get("no_connect", 0) + 1
+
+            elif item_type == "label":
+                sx, sy = snap_point_fine(item["x"], item["y"])
+                rotation = item.get("rotation", 0)
+                model.labels.append(NetLabel(name=item["name"], x=sx, y=sy, rotation=rotation))
+                counts["label"] = counts.get("label", 0) + 1
+
+            elif item_type == "junction":
+                sx, sy = snap_point_fine(item["x"], item["y"])
+                model.junctions.append(Junction(x=sx, y=sy))
+                counts["junction"] = counts.get("junction", 0) + 1
+
+            elif item_type == "power_symbol":
+                sx, sy = snap_point_fine(item["x"], item["y"])
+                power_net = item["net"]
+                rotation = item.get("rotation", 0)
+
+                lib_text = lib_manager.get_power_symbol_text(power_net)
+                lib_id = f"power:{power_net}"
+                model.add_lib_symbol(lib_id, lib_text)
+
+                if power_net == "PWR_FLAG":
+                    pwr_ref = _next_auto_ref(model, "#FLG")
+                else:
+                    pwr_ref = _next_auto_ref(model, "#PWR")
+
+                pwr_comp = Component(
+                    lib_id=lib_id, x=sx, y=sy, rotation=rotation,
+                    reference=pwr_ref, value=power_net, is_power=True,
+                    pins=[PinEntry(number="1")],
+                )
+                pwr_comp.properties = [
+                    PropertyEntry(name="Reference", value=pwr_ref, x=sx, y=sy - 3.81, hidden=True),
+                    PropertyEntry(name="Value", value=power_net, x=sx, y=sy + 3.556),
+                    PropertyEntry(name="Footprint", value="", x=sx, y=sy, hidden=True),
+                    PropertyEntry(name="Datasheet", value="", x=sx, y=sy, hidden=True),
+                    PropertyEntry(
+                        name="Description",
+                        value=f'Power symbol creates a global label with name \\"{power_net}\\"',
+                        x=sx, y=sy, hidden=True,
+                    ),
+                ]
+                model.components.append(pwr_comp)
+                counts["power_symbol"] = counts.get("power_symbol", 0) + 1
+
+            else:
+                errors.append(f"Item {i}: unknown type '{item_type}'")
+
+        except KeyError as e:
+            errors.append(f"Item {i} ({item_type}): missing field {e}")
+        except Exception as e:
+            errors.append(f"Item {i} ({item_type}): {e}")
+
+    _save(schematic_path, model)
+
+    result: dict = {"status": "ok", "added": counts}
+    if errors:
+        result["errors"] = errors
+    return json.dumps(result, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Refinement Tools
 # ---------------------------------------------------------------------------
@@ -590,18 +840,15 @@ def move_component(
 
     _save(schematic_path, model)
 
-    state = get_circuit_state(schematic_path)
-    comp_state = None
-    for c in state.get("components", []) + state.get("power_symbols", []):
-        if c["reference"] == reference:
-            comp_state = c
-            break
+    # Compute pins from lib data
+    lib_text = model.lib_symbol_texts.get(comp.lib_id)
+    pins = _compute_component_pins(lib_text, sx, sy, comp.rotation) if lib_text else []
 
     return json.dumps({
         "status": "ok",
         "reference": reference,
         "position": {"x": sx, "y": sy},
-        "component": comp_state,
+        "pins": pins,
     }, indent=2)
 
 
@@ -670,6 +917,7 @@ def delete_all_wires(schematic_path: str) -> str:
 def delete_component(schematic_path: str, reference: str) -> str:
     """Remove a component from the schematic.
 
+    Works for regular components AND power symbols (e.g., "#PWR01", "#FLG01").
     Does NOT remove connected wires — you may want to delete those too.
 
     Args:
@@ -686,6 +934,59 @@ def delete_component(schematic_path: str, reference: str) -> str:
         return json.dumps({"status": "ok", "message": f"Component '{reference}' deleted"})
     else:
         return json.dumps({"status": "not_found", "message": f"Component '{reference}' not found"})
+
+
+@mcp.tool()
+def delete_no_connect(schematic_path: str, x: float, y: float) -> str:
+    """Remove a no-connect flag near the given position.
+
+    Uses 1mm tolerance for fuzzy matching.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        x: X position in mm (near the no-connect to remove).
+        y: Y position in mm.
+
+    Returns:
+        JSON with status ("ok" or "not_found").
+    """
+    model = _get_model(schematic_path)
+    removed = model.remove_no_connect(x, y)
+    if removed:
+        _save(schematic_path, model)
+        return json.dumps({"status": "ok", "message": "No-connect removed"})
+    else:
+        return json.dumps({"status": "not_found", "message": "No no-connect found near that position (1mm tolerance)"})
+
+
+@mcp.tool()
+def delete_label(
+    schematic_path: str,
+    net_name: str,
+    x: float | None = None,
+    y: float | None = None,
+) -> str:
+    """Remove a net label by name and optional position.
+
+    If x and y are provided, only removes the label at that position.
+    If only net_name is provided, removes the first label with that name.
+
+    Args:
+        schematic_path: Absolute path to the .kicad_sch file.
+        net_name: Name of the net label to remove.
+        x: Optional X position for precise matching (1mm tolerance).
+        y: Optional Y position for precise matching (1mm tolerance).
+
+    Returns:
+        JSON with status.
+    """
+    model = _get_model(schematic_path)
+    removed = model.remove_label(net_name, x, y)
+    if removed:
+        _save(schematic_path, model)
+        return json.dumps({"status": "ok", "message": f"Label '{net_name}' removed"})
+    else:
+        return json.dumps({"status": "not_found", "message": f"Label '{net_name}' not found"})
 
 
 @mcp.tool()
@@ -788,18 +1089,15 @@ def rotate_component(
 
     _save(schematic_path, model)
 
-    state = get_circuit_state(schematic_path)
-    comp_state = None
-    for c in state.get("components", []) + state.get("power_symbols", []):
-        if c["reference"] == reference:
-            comp_state = c
-            break
+    # Compute pins from lib data
+    lib_text = model.lib_symbol_texts.get(comp.lib_id)
+    pins = _compute_component_pins(lib_text, comp.x, comp.y, rotation) if lib_text else []
 
     return json.dumps({
         "status": "ok",
         "reference": reference,
         "rotation": rotation,
-        "component": comp_state,
+        "pins": pins,
     }, indent=2)
 
 

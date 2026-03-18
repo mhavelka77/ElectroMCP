@@ -2,6 +2,8 @@
 
 Uses kicad-skip ONLY for reading — never for writing.
 Resolves pin positions, extracts component state, etc.
+Also provides helpers for loading an existing .kicad_sch file into a
+SchematicModel so that tool mutations preserve all existing elements.
 """
 
 from __future__ import annotations
@@ -9,12 +11,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-from .geometry import outward_direction
+from .geometry import (
+    extract_pins_from_lib_text,
+    outward_direction,
+    pin_world_position,
+    snap_fine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +73,56 @@ def _find_kicad_cli() -> str:
 KICAD_CLI = _find_kicad_cli()
 
 
-def _parse_symbol(sym: object) -> dict:
+# ---------------------------------------------------------------------------
+# Pin position computation from lib_symbol data
+# ---------------------------------------------------------------------------
+
+def _compute_pin_positions(
+    lib_symbol_text: str | None,
+    comp_x: float,
+    comp_y: float,
+    comp_rotation: float,
+) -> list[dict]:
+    """Compute world-space pin positions from lib_symbol text.
+
+    This replaces kicad-skip's pin location data which is incorrect
+    for rotated components.
+
+    Returns:
+        List of dicts with keys: number, name, x, y, direction.
+    """
+    if not lib_symbol_text:
+        return []
+
+    raw_pins = extract_pins_from_lib_text(lib_symbol_text)
+    pins: list[dict] = []
+    for pin_num, pin_name, local_x, local_y in raw_pins:
+        wx, wy = pin_world_position(
+            comp_x, comp_y, comp_rotation, local_x, local_y,
+        )
+        # Snap to fine grid so positions match wire endpoints
+        wx = snap_fine(wx)
+        wy = snap_fine(wy)
+        pins.append({
+            "number": pin_num,
+            "name": pin_name,
+            "x": round(wx, 4),
+            "y": round(wy, 4),
+            "direction": 0,  # simplified — direction depends on pin rotation + comp rotation
+        })
+    return pins
+
+
+# ---------------------------------------------------------------------------
+# kicad-skip-based state reading
+# ---------------------------------------------------------------------------
+
+def _parse_symbol(sym: object, lib_texts: dict[str, str] | None = None) -> dict:
     """Extract component data from a kicad-skip symbol object.
 
-    Returns a dict with keys: reference, value, lib_id, x, y, rotation,
-    pins, properties.
+    If *lib_texts* is provided (mapping lib_id → raw lib_symbol text),
+    pin positions are computed from the lib data instead of relying on
+    kicad-skip (which gets rotated components wrong).
     """
     try:
         ref = str(sym.property.Reference.value)
@@ -94,7 +147,12 @@ def _parse_symbol(sym: object) -> dict:
     except Exception:
         sx, sy, sr = 0.0, 0.0, 0.0
 
-    pins = _parse_pins(sym, sx, sy)
+    # Prefer our own pin computation over kicad-skip
+    if lib_texts and lib_id in lib_texts:
+        pins = _compute_pin_positions(lib_texts[lib_id], sx, sy, sr)
+    else:
+        pins = _parse_pins_from_skip(sym, sx, sy)
+
     properties = _parse_properties(sym)
 
     return {
@@ -109,8 +167,8 @@ def _parse_symbol(sym: object) -> dict:
     }
 
 
-def _parse_pins(sym: object, default_x: float, default_y: float) -> list[dict]:
-    """Extract pin data from a kicad-skip symbol object."""
+def _parse_pins_from_skip(sym: object, default_x: float, default_y: float) -> list[dict]:
+    """Fallback: extract pin data from a kicad-skip symbol object."""
     pins: list[dict] = []
     if sym.pin is None:
         return pins
@@ -169,7 +227,7 @@ def get_circuit_state(schematic_path: str) -> dict:
 
     Returns:
         Dict with keys: root_uuid, components, wires, labels, junctions,
-        power_symbols. See the tool docstring in server.py for full schema.
+        power_symbols, no_connects.
     """
     import skip
 
@@ -181,7 +239,12 @@ def get_circuit_state(schematic_path: str) -> dict:
             "labels": [],
             "junctions": [],
             "power_symbols": [],
+            "no_connects": [],
         }
+
+    # Extract lib_symbol texts for pin position computation
+    raw_text = path.read_text(encoding="utf-8")
+    lib_texts = _extract_lib_symbols_from_file(raw_text)
 
     sch = skip.Schematic(str(path))
     root_uuid = str(sch.uuid.value) if hasattr(sch.uuid, 'value') else str(sch.uuid)
@@ -191,8 +254,8 @@ def get_circuit_state(schematic_path: str) -> dict:
 
     if sch.symbol is not None:
         for sym in sch.symbol:
-            entry = _parse_symbol(sym)
-            if entry["reference"].startswith("#PWR"):
+            entry = _parse_symbol(sym, lib_texts)
+            if entry["reference"].startswith("#PWR") or entry["reference"].startswith("#FLG"):
                 power_symbols.append(entry)
             else:
                 components.append(entry)
@@ -241,6 +304,29 @@ def get_circuit_state(schematic_path: str) -> dict:
             except Exception:
                 pass
 
+    # Parse no_connects
+    no_connects: list[dict] = []
+    if hasattr(sch, 'no_connect') and sch.no_connect is not None:
+        for nc in sch.no_connect:
+            try:
+                at_val = nc.at.value
+                no_connects.append({
+                    "x": round(float(at_val[0]), 4),
+                    "y": round(float(at_val[1]), 4),
+                })
+            except Exception:
+                pass
+
+    # Fallback: parse no_connects from raw text if kicad-skip didn't find them
+    if not no_connects:
+        for m in re.finditer(
+            r'\(no_connect\s+\(at\s+([-\d.]+)\s+([-\d.]+)\)', raw_text,
+        ):
+            no_connects.append({
+                "x": round(float(m.group(1)), 4),
+                "y": round(float(m.group(2)), 4),
+            })
+
     return {
         "root_uuid": root_uuid,
         "components": components,
@@ -248,8 +334,348 @@ def get_circuit_state(schematic_path: str) -> dict:
         "labels": labels,
         "junctions": junctions,
         "power_symbols": power_symbols,
+        "no_connects": no_connects,
     }
 
+
+# ---------------------------------------------------------------------------
+# File loading helpers — used by server._load_model_from_file
+# ---------------------------------------------------------------------------
+
+def _extract_lib_symbols_from_file(raw_text: str) -> dict[str, str]:
+    """Extract lib_symbol blocks from raw .kicad_sch text.
+
+    Returns a dict mapping lib_id (e.g. "Device:R") to the raw S-expression
+    text of that symbol definition (WITHOUT leading/trailing whitespace,
+    at the indent level used inside the lib_symbols section).
+    """
+    result: dict[str, str] = {}
+
+    # Find the (lib_symbols ...) section
+    ls_match = re.search(r'\(lib_symbols\b', raw_text)
+    if not ls_match:
+        return result
+
+    # Find each top-level (symbol "LIB:NAME" ...) inside lib_symbols
+    start = ls_match.start()
+    # Find the end of lib_symbols by counting parens
+    depth = 0
+    i = start
+    while i < len(raw_text):
+        if raw_text[i] == '(':
+            depth += 1
+        elif raw_text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    lib_section = raw_text[start:i + 1]
+
+    # Extract each symbol block within the lib_symbols section
+    for m in re.finditer(r'\n\t\t\(symbol "([^"]+)"', lib_section):
+        sym_name = m.group(1)
+        # Skip sub-symbols (name_N_N pattern)
+        if re.search(r'_\d+_\d+$', sym_name):
+            continue
+
+        block_start = m.start() + 1  # skip the leading newline
+        # Count parens to find end of this symbol block
+        d = 0
+        j = block_start
+        while j < len(lib_section):
+            if lib_section[j] == '(':
+                d += 1
+            elif lib_section[j] == ')':
+                d -= 1
+                if d == 0:
+                    break
+            j += 1
+        block = lib_section[block_start:j + 1].strip()
+        result[sym_name] = block
+
+    return result
+
+
+def _extract_no_connects_from_file(
+    raw_text: str,
+) -> list[tuple[float, float, str]]:
+    """Extract (x, y, uuid) tuples for no_connect elements from raw text."""
+    results: list[tuple[float, float, str]] = []
+    for m in re.finditer(
+        r'\(no_connect\s+\(at\s+([-\d.]+)\s+([-\d.]+)\)\s+\(uuid "([^"]+)"\)',
+        raw_text,
+    ):
+        results.append((float(m.group(1)), float(m.group(2)), m.group(3)))
+    return results
+
+
+_KNOWN_TOP_LEVEL = frozenset({
+    "version", "generator", "generator_version", "uuid", "paper",
+    "lib_symbols", "symbol", "wire", "label", "junction", "no_connect",
+    "sheet_instances",
+})
+
+
+def _extract_passthrough_blocks(raw_text: str) -> list[str]:
+    """Extract top-level S-expression blocks not tracked by the model.
+
+    These are preserved verbatim across file rewrites.  Includes elements
+    like ``(text ...)``, ``(polyline ...)``, ``(global_label ...)``,
+    ``(bus ...)``, ``(title_block ...)``, etc.
+    """
+    blocks: list[str] = []
+
+    # Find the start of the kicad_sch body
+    ks_match = re.search(r'\(kicad_sch\b', raw_text)
+    if not ks_match:
+        return blocks
+
+    i = ks_match.end()
+    end = len(raw_text)
+
+    while i < end:
+        # Skip whitespace
+        while i < end and raw_text[i] in ' \t\n\r':
+            i += 1
+        if i >= end or raw_text[i] == ')':
+            break
+
+        if raw_text[i] == '(':
+            block_start = i
+            # Read block type
+            j = i + 1
+            while j < end and raw_text[j] not in ' \t\n\r()':
+                j += 1
+            block_type = raw_text[i + 1:j]
+
+            # Count parens to find end
+            depth = 1
+            k = i + 1
+            while k < end and depth > 0:
+                ch = raw_text[k]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                elif ch == '"':
+                    k += 1
+                    while k < end and raw_text[k] != '"':
+                        if raw_text[k] == '\\':
+                            k += 1
+                        k += 1
+                k += 1
+
+            block_text = raw_text[block_start:k]
+
+            if block_type not in _KNOWN_TOP_LEVEL:
+                blocks.append(block_text)
+
+            i = k
+        else:
+            i += 1
+
+    return blocks
+
+
+def symbol_to_component(skip_sym: object) -> "Component":
+    """Convert a kicad-skip symbol object to a writer.Component."""
+    from .writer import Component, PinEntry, PropertyEntry
+
+    try:
+        lib_id = str(skip_sym.lib_id.value)
+    except Exception:
+        lib_id = "?"
+
+    try:
+        at_val = skip_sym.at.value
+        sx = float(at_val[0])
+        sy = float(at_val[1])
+        sr = float(at_val[2]) if len(at_val) > 2 else 0.0
+    except Exception:
+        sx, sy, sr = 0.0, 0.0, 0.0
+
+    try:
+        unit = int(skip_sym.unit.value)
+    except Exception:
+        unit = 1
+
+    try:
+        comp_uuid = str(skip_sym.uuid.value) if hasattr(skip_sym.uuid, 'value') else str(skip_sym.uuid)
+    except Exception:
+        from .writer import _uuid
+        comp_uuid = _uuid()
+
+    try:
+        ref = str(skip_sym.property.Reference.value)
+    except Exception:
+        ref = "?"
+    try:
+        val = str(skip_sym.property.Value.value)
+    except Exception:
+        val = "?"
+
+    is_power = ref.startswith("#PWR") or ref.startswith("#FLG")
+
+    # Extract pins
+    pins: list[PinEntry] = []
+    if skip_sym.pin is not None:
+        for p in skip_sym.pin:
+            pin_num = str(p.number) if hasattr(p, 'number') else "?"
+            try:
+                pin_uuid = str(p.uuid.value) if hasattr(p.uuid, 'value') else str(p.uuid)
+            except Exception:
+                from .writer import _uuid
+                pin_uuid = _uuid()
+            pins.append(PinEntry(number=pin_num, uuid=pin_uuid))
+
+    # Extract properties
+    properties: list[PropertyEntry] = []
+    for prop_name in ("Reference", "Value", "Footprint", "Datasheet", "Description"):
+        try:
+            prop = getattr(skip_sym.property, prop_name, None)
+            if prop is None:
+                continue
+            prop_val = str(prop.value) if hasattr(prop, 'value') else ""
+
+            prop_x, prop_y, prop_rot = sx, sy, 0.0
+            if hasattr(prop, 'at') and prop.at is not None:
+                pat = prop.at.value
+                prop_x = float(pat[0])
+                prop_y = float(pat[1])
+                prop_rot = float(pat[2]) if len(pat) > 2 else 0.0
+
+            hidden = False
+            try:
+                if hasattr(prop, 'effects') and prop.effects is not None:
+                    eff = prop.effects
+                    if hasattr(eff, 'hide') and eff.hide is not None:
+                        hidden = True
+            except Exception:
+                pass
+
+            font_size = 1.27
+            try:
+                if hasattr(prop, 'effects') and prop.effects is not None:
+                    font = prop.effects.font
+                    if font is not None and hasattr(font, 'size') and font.size is not None:
+                        font_size = float(font.size.value[0])
+            except Exception:
+                pass
+
+            properties.append(PropertyEntry(
+                name=prop_name,
+                value=prop_val,
+                x=prop_x,
+                y=prop_y,
+                rotation=prop_rot,
+                font_size=font_size,
+                hidden=hidden,
+            ))
+        except Exception:
+            pass
+
+    # Extract footprint/datasheet/description from properties if available
+    footprint = ""
+    datasheet = "~"
+    description = ""
+    for prop in properties:
+        if prop.name == "Footprint":
+            footprint = prop.value
+        elif prop.name == "Datasheet":
+            datasheet = prop.value
+        elif prop.name == "Description":
+            description = prop.value
+
+    comp = Component(
+        lib_id=lib_id,
+        x=sx, y=sy,
+        rotation=sr,
+        unit=unit,
+        reference=ref,
+        value=val,
+        footprint=footprint,
+        datasheet=datasheet,
+        description=description,
+        uuid=comp_uuid,
+        pins=pins,
+        properties=properties,
+        is_power=is_power,
+    )
+    return comp
+
+
+def wire_to_model(skip_wire: object) -> "Wire | None":
+    """Convert a kicad-skip wire to a writer.Wire."""
+    from .writer import Wire
+    try:
+        pts = skip_wire.pts.xy
+        if len(pts) >= 2:
+            p0 = pts[0].value
+            p1 = pts[1].value
+            wire_uuid = ""
+            try:
+                wire_uuid = str(skip_wire.uuid.value) if hasattr(skip_wire.uuid, 'value') else str(skip_wire.uuid)
+            except Exception:
+                from .writer import _uuid
+                wire_uuid = _uuid()
+            return Wire(
+                x1=float(p0[0]), y1=float(p0[1]),
+                x2=float(p1[0]), y2=float(p1[1]),
+                uuid=wire_uuid,
+            )
+    except Exception:
+        pass
+    return None
+
+
+def label_to_model(skip_label: object) -> "NetLabel | None":
+    """Convert a kicad-skip label to a writer.NetLabel."""
+    from .writer import NetLabel
+    try:
+        name = str(skip_label.value) if hasattr(skip_label, 'value') else "?"
+        at_val = skip_label.at.value
+        label_uuid = ""
+        try:
+            label_uuid = str(skip_label.uuid.value) if hasattr(skip_label.uuid, 'value') else str(skip_label.uuid)
+        except Exception:
+            from .writer import _uuid
+            label_uuid = _uuid()
+        return NetLabel(
+            name=name,
+            x=float(at_val[0]),
+            y=float(at_val[1]),
+            rotation=float(at_val[2]) if len(at_val) > 2 else 0.0,
+            uuid=label_uuid,
+        )
+    except Exception:
+        pass
+    return None
+
+
+def junction_to_model(skip_junction: object) -> "Junction | None":
+    """Convert a kicad-skip junction to a writer.Junction."""
+    from .writer import Junction
+    try:
+        at_val = skip_junction.at.value
+        junc_uuid = ""
+        try:
+            junc_uuid = str(skip_junction.uuid.value) if hasattr(skip_junction.uuid, 'value') else str(skip_junction.uuid)
+        except Exception:
+            from .writer import _uuid
+            junc_uuid = _uuid()
+        return Junction(
+            x=float(at_val[0]),
+            y=float(at_val[1]),
+            uuid=junc_uuid,
+        )
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Render & ERC
+# ---------------------------------------------------------------------------
 
 def render_schematic(schematic_path: str, output_width: int = 2400) -> bytes:
     """Render a schematic to PNG via kicad-cli SVG export and cairosvg.
@@ -376,9 +802,10 @@ def _summarise_erc(erc_data: dict) -> dict:
                 item_entry: dict = {"description": item.get("description", "")}
                 pos = item.get("pos")
                 if pos:
-                    # KiCad ERC JSON reports positions in metres; convert to mm
-                    item_entry["x"] = round(pos.get("x", 0) * 1000, 4)
-                    item_entry["y"] = round(pos.get("y", 0) * 1000, 4)
+                    # ERC JSON position values × 100 = mm (empirically verified).
+                    # The raw values appear to be in an internal unit ≈ 0.01 mm.
+                    item_entry["x"] = round(pos.get("x", 0) * 100, 4)
+                    item_entry["y"] = round(pos.get("y", 0) * 100, 4)
                 items.append(item_entry)
 
             violations.append({
